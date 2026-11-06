@@ -467,6 +467,9 @@ prog_push_sources() {
   minix_mount_img "$MINIX_WORK_IMAGE_PATH"
   trap 'minix_umount_img; echo_err "Failed to push source files";' ERR
 
+  rm -rf "$MINIX_USR_MOUNT_DIR/src"
+  rm -rf "$MINIX_USR_MOUNT_DIR/include"
+
   cp -rf "$MINIX_SOURCES_DIR/src/." "$MINIX_USR_MOUNT_DIR/src"
   cp -rf "$MINIX_SOURCES_DIR/include/." "$MINIX_USR_MOUNT_DIR/include"
 
