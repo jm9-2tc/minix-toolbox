@@ -16,8 +16,9 @@ MINIX_WORK_IMAGE_PATH="$TOOLBOX_SUBDIR/minix.work.img"
 
 # qemu minix communication
 HOST=127.0.0.1
-MINIX_TERM_PORT=4001
-QEMU_MON_PORT=4002
+QEMU_MON_PORT=4001
+MINIX_TTY00_PORT=4002
+MINIX_TTY01_PORT=4003
 
 # END CONFIG
 
@@ -33,11 +34,13 @@ echo_err() {
 # minix emulation control
 
 # stream 3 - QEMU Monitor
-# stream 4 - MINIX Terminal
+# stream 4 - MINIX tty00 (with terminal running)
+# stream 5 - MINIX tty01
 
 minix_cleanup_streams() {
   exec 3<&- 3>&- || true
   exec 4<&- 4>&- || true
+  exec 5<&- 5>&- || true
 }
 
 minix_create_streams() {
@@ -47,8 +50,11 @@ minix_create_streams() {
   exec 3<>/dev/tcp/"$HOST"/"$QEMU_MON_PORT" ||
     error="Failed to connect to QEMU Monitor server on ${HOST}:${QEMU_MON_PORT}"
 
-  exec 4<>/dev/tcp/"$HOST"/"$MINIX_TERM_PORT" ||
-    error="Failed to connect to minix terminal server on ${HOST}:${MINIX_TERM_PORT}"
+  exec 4<>/dev/tcp/"$HOST"/"$MINIX_TTY00_PORT" ||
+    error="Failed to connect to minix tty00 server on ${HOST}:${MINIX_TTY00_PORT}"
+
+  exec 5<>/dev/tcp/"$HOST"/"$MINIX_TTY01_PORT" ||
+    error="Failed to connect to minix tty01 server on ${HOST}:${MINIX_TTY01_PORT}"
 
   if [ -n "$error" ]; then
     echo_err "$error"
@@ -85,7 +91,8 @@ minix_start_emulation() {
   qemu-system-i386 \
     -display none \
     -drive format=raw,file="$1" \
-    -serial tcp:"$HOST":"$MINIX_TERM_PORT",server,nowait \
+    -serial tcp:"$HOST":"$MINIX_TTY00_PORT",server,nowait \
+    -serial tcp:"$HOST":"$MINIX_TTY01_PORT",server,nowait \
     -monitor tcp:"$HOST":"$QEMU_MON_PORT",server,nowait \
     2>&1 &
 
@@ -127,17 +134,32 @@ minix_finish_emulation() {
   echo "Minix emulation finished"
 }
 
-minix_stream_lines_to_marker() {
-  # $1 - marker
-  # stream lines until finish marker was found (or 30s timeout triggered)
-  sleep 0.2
-  while read -r -t 30 line <&4; do
-    line="${line%$'\r'}"
-    if [ "$line" = "$1" ]; then
-      break
+# minix command executing
+
+minix_exec_and_stream() {
+  # $1 - command to exec
+  local marker="__DONE_MARKER__"
+
+  echo "( $1 ) 2>/dev/tty01 >/dev/tty01; printf '\n$marker\n'" >&4
+  ( grep -q "$marker" <&4; ) &
+  local term_scanner_pid=$!
+  local running=1
+
+  while [ $running == 1 ]; do
+    read -r -t 1 line <&5 2>/dev/null
+    ! [ -z "$line" ] && echo "$line"
+
+    if ! kill -1 "$term_scanner_pid" 2>/dev/null; then
+      wait "$term_scanner_pid"
+      local status=$?
+      if [ $status != 0 ]; then
+        echo_err "an error was encountered while executing the command"
+      fi
+      running=0
     fi
-    echo "$line"
   done
+
+  return 0
 }
 
 # minix images mounting
@@ -368,10 +390,7 @@ prog_build() {
   minix_start_emulation "$MINIX_WORK_IMAGE_PATH" emul_pid
 
   if minix_wait_for_terminal; then
-    # run build
-    local marker='__BUILD_MARKER__'
-    echo "cd /usr/src/tools && make clean && make hdboot; printf '\n$marker\n'" >&4
-    minix_stream_lines_to_marker $marker
+    minix_exec_and_stream "cd /usr/src/tools && make clean && make hdboot"
   fi
 
   minix_finish_emulation "$emul_pid"
@@ -417,14 +436,14 @@ prog_run() {
     if [ $is_c_script == 1 ]; then
       local out_prog_name="${filename%.*}"
       echo "Compiling C script..."
-      echo "cd /usr/run_script/ && cc -o '$out_prog_name' '$filename'; printf '\n$marker\n'" >&4
-      minix_stream_lines_to_marker $marker
+      minix_exec_and_stream "cd /usr/run_script/ && cc -o '$out_prog_name' '$filename'" && true
       filename="$out_prog_name"
     fi
 
     echo "Running script..."
-    echo "cd /usr/run_script/ && chmod +x '$filename' && './$filename'; printf '\n$marker\n'" >&4
-    minix_stream_lines_to_marker $marker
+    minix_exec_and_stream "cd /usr/run_script/ && chmod +x '$filename' && './$filename'" && true
+
+    echo "Script execution finished."
   fi
 
   trap - ERR
