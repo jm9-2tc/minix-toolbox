@@ -255,6 +255,7 @@ minix_download_base_image() {
 # toolbox common functions
 
 toolbox_init_dirs() {
+  rm -r "$TOOLBOX_SUBDIR"
   mkdir "$TOOLBOX_SUBDIR" "$MINIX_USR_MOUNT_DIR" "$MINIX_ROOT_MOUNT_DIR" ||
     {
       echo_err "Failed to prepare $SCRIPT_NAME subdirectories."
@@ -536,14 +537,16 @@ print_usage() {
 Usage: $SCRIPT_NAME <command> [command options]
 
 Commands:
-  build         Sync source files and run minix compilation (make hdboot) on the current image.
+  setup         Download the image from URL (defined in config) and prepare it to be used with this toolbox automation.
+                This command recompiles the downloaded image with RS232 serial port support enabled.
+                The minix sources are copied to the workdir.
+                If the workdir currently contains '.minix-toolkit' subdirectory after previous 'setup' call,
+                it will be deleted.
+
+  build         Execute push and run minix compilation (make hdboot) on the current image.
 
   run FILEPATH  Run a C/shell script on minix. If it is a C script it will be compiled before execution.
                 Script is treated as C script only if it has a '.c' extension, otherwise it is treated as shell script.
-
-  setup         Download the image from URL (defined in config) and prepare it to be used with build automation.
-                This command recompiles the downloaded image with RS232 serial port support enabled.
-                The minix sources are copied to workdir.
 
   push          Copy changed source files form the workspace to minix image.
 
