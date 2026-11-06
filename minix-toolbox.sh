@@ -431,6 +431,7 @@ prog_run() {
   rm -rf "$dir_path"
   mkdir "$dir_path"
   cp "$1" "$dir_path"
+  chown -R 0:0 "$MINIX_USR_MOUNT_DIR/run_script"
 
   minix_umount_img
   trap - ERR
@@ -467,6 +468,9 @@ prog_push_sources() {
 
   cp -r "$MINIX_MINIX_SOURCES_DIR/src" "$MINIX_USR_MOUNT_DIR/src"
   cp -r "$MINIX_MINIX_SOURCES_DIR/include" "$MINIX_USR_MOUNT_DIR/include"
+
+  chown -R 0:0 "$MINIX_USR_MOUNT_DIR/src"
+  chown -R 0:0 "$MINIX_USR_MOUNT_DIR/include"
 
   echo "Successfully pushed source files"
   minix_umount_img
