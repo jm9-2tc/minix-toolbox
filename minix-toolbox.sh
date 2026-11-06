@@ -1,0 +1,567 @@
+#!/bin/bash
+
+# CONFIG
+
+# minix image source
+MINIX_IMAGE_URL="http://www.ia.pw.edu.pl/~tkruk/edu/soi.b/lab/minix/minix203.img"
+
+# tool paths
+WORKDIR="."
+TOOLBOX_SUBDIR="$WORKDIR/.minix-toolbox"
+MINIX_SOURCES_DIR="$WORKDIR/minix_sources"
+MINIX_USR_MOUNT_DIR="$TOOLBOX_SUBDIR/mnt_usr"
+MINIX_ROOT_MOUNT_DIR="$TOOLBOX_SUBDIR/mnt_root"
+MINIX_BASE_IMAGE_PATH="$TOOLBOX_SUBDIR/minix.base.img"
+MINIX_WORK_IMAGE_PATH="$TOOLBOX_SUBDIR/minix.work.img"
+
+# qemu minix communication
+HOST=127.0.0.1
+MINIX_TERM_PORT=4001
+QEMU_MON_PORT=4002
+
+# END CONFIG
+
+# common utilities
+
+SCRIPT_VERSION="0.1.0"
+SCRIPT_NAME=$(basename "$0")
+
+echo_err() {
+  echo "$SCRIPT_NAME: error: $1" 1>&2
+}
+
+# minix emulation control
+
+# stream 3 - QEMU Monitor
+# stream 4 - MINIX Terminal
+
+minix_cleanup_streams() {
+  exec 3<&- 3>&- || true
+  exec 4<&- 4>&- || true
+}
+
+minix_create_streams() {
+  local error=""
+  echo "Connecting to minix terminal and QEMU monitor."
+
+  exec 3<>/dev/tcp/"$HOST"/"$QEMU_MON_PORT" ||
+    error="Failed to connect to QEMU Monitor server on ${HOST}:${QEMU_MON_PORT}"
+
+  exec 4<>/dev/tcp/"$HOST"/"$MINIX_TERM_PORT" ||
+    error="Failed to connect to minix terminal server on ${HOST}:${MINIX_TERM_PORT}"
+
+  if [ -n "$error" ]; then
+    echo_err "$error"
+    return 1
+  fi
+  return 0
+}
+
+minix_wait_for_terminal() {
+  local retries=5
+  echo "Waiting for minix terminal to start."
+
+  while [ $retries -ge 0 ]; do
+    if IFS= read -r -d '' -n 1 -t 1 char <&4; then
+      if [ "$char" = "#" ]; then
+        return 0
+      fi
+    fi
+
+    sleep 1
+    ((retries--))
+    echo "."
+  done
+
+  echo_err "timeout while connecting to minix terminal"
+  return 1
+}
+
+minix_start_emulation() {
+  # $1 - minix image path
+  # $2 - minix emul pid ref
+  local -n pid=$2
+
+  qemu-system-i386 \
+    -display none \
+    -drive format=raw,file="$1" \
+    -serial tcp:"$HOST":"$MINIX_TERM_PORT",server,nowait \
+    -monitor tcp:"$HOST":"$QEMU_MON_PORT",server,nowait \
+    2>&1 &
+
+  pid=$!
+
+  sleep 0.5
+  # log error if emulation terminated immediately due to an error
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo_err "minix emulation failed to start"
+    return 1
+  fi
+  echo "minix Emulation has started (pid=$pid)"
+  sleep 3
+  if ! minix_create_streams; then
+    kill $pid
+    kill -9 $pid
+    return 1
+  fi
+
+  echo "Booting minix"
+  echo "sendkey equal" >&3 # qemu monitor: send =
+}
+
+minix_finish_emulation() {
+  # $1 - qemu emulation pid
+  echo "Terminating minix emulation..."
+  echo "shutdown" >&4
+  sleep 5
+  echo "quit" >&3 # qemu monitor: quit
+
+  # kill emulation if it doesn't finish
+  sleep 0.5
+  if kill -0 $1 2>/dev/null; then
+    sleep 3
+    kill -9 $1 2>/dev/null
+  fi
+
+  minix_cleanup_streams
+  echo "Minix emulation finished"
+}
+
+minix_stream_lines_to_marker() {
+  # $1 - marker
+  # stream lines until finish marker was found (or 30s timeout triggered)
+  sleep 0.2
+  while read -r -t 30 line <&4; do
+    line="${line%$'\r'}"
+    if [ "$line" = "$1" ]; then
+      break
+    fi
+    echo "$line"
+  done
+}
+
+# minix images mounting
+
+minix_read_image_subpartitions_info() {
+  set -e
+  local img_path=$1
+  local -n root_offs=$2 root_siz=$3 usr_offs=$4 usr_siz=$5
+
+  trap 'trap - ERR; echo_err "Failed to read minix subpartitions from the image file"; return 1;' ERR
+
+  if ! [ -f "$img_path" ]; then
+    echo_err "minix image was not found at $img_path"
+    false # finish with err
+  fi
+
+  local mbr_sig=$(od -An -j 510 -N 2 -t x2 --endian big "$img_path" | tr -d ' ')
+  if [ $mbr_sig != "55aa" ]; then
+    echo_err "minix image file has invalid MBR signature"
+    false # finish with err
+  fi
+
+  # read partition 0 offset
+  local p0_sector=$(od -An -j 454 -N 4 -t u4 "$img_path")
+  local p0_offset=$((p0_sector * 512))
+
+  # read minix subpartition offsets
+  local minix_subpart_base=$((p0_offset + 446))
+  local root_sector=$(od -An -j $((minix_subpart_base + 8)) -N 4 -t u4 "$img_path")
+  local root_size_sec=$(od -An -j $((minix_subpart_base + 12)) -N 4 -t u4 "$img_path")
+  local usr_sector=$(od -An -j $((minix_subpart_base + 40)) -N 4 -t u4 "$img_path")
+  local usr_size_sec=$(od -An -j $((minix_subpart_base + 44)) -N 4 -t u4 "$img_path")
+
+  root_offs=$(($root_sector * 512))
+  root_siz=$(($root_size_sec * 512))
+  usr_offs=$(($usr_sector * 512))
+  usr_siz=$(($usr_size_sec * 512))
+
+  trap - ERR
+  return 0
+}
+
+minix_mount_img() {
+  # $1 - image path
+  set -e
+  local mounts_failed=0
+  local root_offset root_size usr_offset usr_size
+
+  minix_read_image_subpartitions_info "$1" root_offset root_size usr_offset usr_size
+
+  trap \
+    $'minix_umount_img 2>/dev/null; echo_err "Failed to mount the minix image. Make sure the image isn\'t already mounted."; return 1;' \
+    ERR
+  mount -t minix -o loop,offset="$root_offset",sizelimit="$root_size" "$1" "$MINIX_ROOT_MOUNT_DIR"
+  mount -t minix -o loop,offset="$usr_offset",sizelimit="$usr_size" "$1" "$MINIX_USR_MOUNT_DIR"
+
+  cat <<EOF
+Mounted minix image partitions:
+/        offset: $root_offset, size: $root_size, mounted at: "$MINIX_ROOT_MOUNT_DIR"
+/usr     offset: $usr_offset, size: $usr_size, mounted at: "$MINIX_USR_MOUNT_DIR"
+EOF
+
+  trap - ERR
+  return 0
+}
+
+minix_umount_img() {
+  echo "Unmounting minix image partitions"
+
+  sync
+  umount "$MINIX_USR_MOUNT_DIR"
+  umount "$MINIX_ROOT_MOUNT_DIR"
+}
+
+# minix image download
+
+minix_download_base_image() {
+  echo "Downloading minix image..."
+  wget -O "$MINIX_BASE_IMAGE_PATH" "$MINIX_IMAGE_URL" ||
+    {
+      echo_err "Failed to download minix image from URL provided in config."
+      return 1
+    }
+  return 0
+}
+
+# toolbox common functions
+
+toolbox_init_dirs() {
+  mkdir "$TOOLBOX_SUBDIR" "$MINIX_USR_MOUNT_DIR" "$MINIX_ROOT_MOUNT_DIR" ||
+    {
+      echo_err "Failed to prepare $SCRIPT_NAME subdirectories."
+      return 1
+    }
+  return 0
+}
+
+toolbox_copy_source_dirs_from_mounted_image() {
+  # $1 image path
+  set -e
+  trap 'trap - ERR; return 1;' ERR
+
+  rm -rf "$MINIX_SOURCES_DIR"
+  mkdir "$MINIX_SOURCES_DIR"
+
+  cp -r "$MINIX_USR_MOUNT_DIR/src" "$MINIX_SOURCES_DIR/src"
+  cp -r "$MINIX_USR_MOUNT_DIR/include" "$MINIX_SOURCES_DIR/include"
+}
+
+toolbox_workspace_check() {
+  if [ -d "$TOOLBOX_SUBDIR" ]; then
+    return 0
+  fi
+  echo_err "This command needs to be run inside a toolkit workspace. Use '$SCRIPT_NAME setup' to initialize workspace in the current workdir."
+  return 1
+}
+
+# subprograms
+
+prog_img_setup() {
+  set -e
+  echo "Setting up workdir for minix..."
+
+  toolbox_init_dirs
+  minix_download_base_image
+
+  minix_mount_img "$MINIX_BASE_IMAGE_PATH"
+  trap 'trap - ERR; minix_umount_img;' ERR
+
+  # enable 2 rs232 serial ports in config.h
+  sed -i 's/^#define[ \t]\+NR_RS_LINES[ \t]\+[0-9]\+/#define	NR_RS_LINES        2/' "${MINIX_USR_MOUNT_DIR}/include/minix/config.h"
+
+  # create bootstrap script
+  echo "Creating bootstrap script."
+  cat <<EOF >"${MINIX_USR_MOUNT_DIR}/etc/bootstrap.sh"
+#!/bin/sh
+rm build.log
+cd /usr/src/tools
+make hdboot > /bootstrap.log 2>&1
+if [ \$? = 0 ]; then
+  echo "BUILD_SUCCESS" >> /bootstrap.log
+else
+  echo "BUILD_FAILURE" >> /bootstrap.log
+fi
+
+rm -f /usr/etc/bootstrap.sh
+shutdown
+EOF
+  chmod +x "${MINIX_USR_MOUNT_DIR}/etc/bootstrap.sh"
+
+  # add bootstrap.sh running to /usr/etc/rc start script
+  echo "Adding bootstrap script to /usr/etc/rc"
+  if ! grep -q "bootstrap.sh" "${MINIX_USR_MOUNT_DIR}/etc/rc"; then
+    cat <<EOF >>"${MINIX_USR_MOUNT_DIR}/etc/rc"
+echo "Checking bootstrap"
+if [ -f /usr/etc/bootstrap.sh ]; then
+    echo "Running bootstrap"
+    sh /usr/etc/bootstrap.sh
+fi
+EOF
+  fi
+
+  trap - ERR
+  minix_umount_img
+
+  echo "Recompiling kernel"
+
+  local emul_pid
+  minix_start_emulation "$MINIX_BASE_IMAGE_PATH" emul_pid
+  trap 'trap - ERR; minix_finish_emulation "$emul_pid";' ERR
+
+  local timeout=100
+
+  echo "Starting minix recompilation and waiting $timeout seconds."
+  echo "If the recompilation won't manage to finish in this time, try increasing this value."
+  sleep $timeout
+
+  trap - ERR
+  minix_finish_emulation "$emul_pid"
+
+  minix_mount_img "$MINIX_BASE_IMAGE_PATH"
+  trap 'trap - ERR; minix_umount_img;' ERR
+
+  # read recompilation status from logs
+  local build_status=2 # 0 - success, 1 - error, 2 - unfinished
+  if [ -f "${MINIX_ROOT_MOUNT_DIR}/bootstrap.log" ]; then
+    local status=$(sed -n '${s/\r$//;p}' "${MINIX_ROOT_MOUNT_DIR}/bootstrap.log")
+    if [ "$status" = "BUILD_SUCCESS" ]; then
+      build_status=0
+    elif [ "$status" = "BUILD_FAILURE" ]; then
+      build_status=1
+    fi
+  fi
+
+  if [ $build_status = 0 ]; then
+    echo "Minix recompilation completed successfully. The image is now ready to be used with minix-toolbox automation."
+  elif [ $build_status = 1 ]; then
+    echo_err "Something went wrong while recompiling minix:"
+    cat "${MINIX_ROOT_MOUNT_DIR}/bootstrap.log"
+    false # produce error to clean up and finish
+  else
+    echo_err "Minix recompilation wasn't completed. Try increasing build timeout."
+    false # produce error to clean up and finish
+  fi
+
+  # modify ttytab to run terminal at tty00 serial
+  sed -i 's/^tty00.*$/tty00\t\tvt100\t\t"\/bin\/sh"/' "${MINIX_ROOT_MOUNT_DIR}/etc/ttytab"
+
+  # copy minix source files
+  echo "Copying source files from minix image"
+  toolbox_copy_source_dirs_from_mounted_image
+
+  trap - ERR
+  minix_umount_img
+
+  # copy base image as work image
+  cp "$MINIX_BASE_IMAGE_PATH" "$MINIX_WORK_IMAGE_PATH"
+
+  echo "Workspace setup completed successfully"
+}
+
+prog_build() {
+  echo "Starting minix recompilation..."
+
+  prog_pull_sources
+
+  local emul_pid
+  minix_start_emulation "$MINIX_WORK_IMAGE_PATH" emul_pid
+
+  if minix_wait_for_terminal; then
+    # run build
+    local marker='__BUILD_MARKER__'
+    echo "cd /usr/src/tools && make clean && make hdboot; printf '\n$marker\n'" >&4
+    minix_stream_lines_to_marker $marker
+  fi
+
+  minix_finish_emulation "$emul_pid"
+}
+
+prog_run() {
+  # $1 - c/sh script path
+  set -e
+
+  if ! [ -f "$1" ]; then
+    echo_err "'$1' does not exist or is not a file."
+    return 1
+  fi
+
+  local filename=`basename "$1"`
+  local is_c_script=0
+  case "$filename" in
+  *.c)
+    is_c_script=1
+    ;;
+  esac
+
+  # copy script to minix image
+  minix_mount_img "$MINIX_WORK_IMAGE_PATH"
+  trap 'trap - ERR; minix_umount_img; return 1;' ERR
+
+  echo "Sending script to minix"
+  local dir_path="$MINIX_USR_MOUNT_DIR/run_script"
+  rm -rf "$dir_path"
+  mkdir "$dir_path"
+  cp "$1" "$dir_path"
+
+  minix_umount_img
+  trap - ERR
+
+  local emul_pid
+  minix_start_emulation "$MINIX_WORK_IMAGE_PATH" emul_pid
+  trap 'trap - ERR; minix_finish_emulation; return 1;' ERR
+
+  # run script (after compilation if it is a C file)
+  if minix_wait_for_terminal; then
+    local marker='__RUN_MARKER__';
+    if [ $is_c_script == 1 ]; then
+      local out_prog_name="${filename%.*}"
+      echo "Compiling C script..."
+      echo "cd /usr/run_script/ && cc -o '$out_prog_name' '$filename'; printf '\n$marker\n'" >&4
+      minix_stream_lines_to_marker $marker
+      filename="$out_prog_name"
+    fi
+
+    echo "Running script..."
+    echo "cd /usr/run_script/ && chmod +x '$filename' && './$filename'; printf '\n$marker\n'" >&4
+    minix_stream_lines_to_marker $marker
+  fi
+
+  trap - ERR
+  minix_finish_emulation "$emul_pid"
+}
+
+prog_push_sources() {
+  set -e
+  echo "Pushing source files to minix image"
+  minix_mount_img "$MINIX_WORK_IMAGE_PATH"
+  trap 'trap - ERR; minix_umount_img; echo_err "Failed to push source files";' ERR
+
+  cp -r "$MINIX_MINIX_SOURCES_DIR/src" "$MINIX_USR_MOUNT_DIR/src"
+  cp -r "$MINIX_MINIX_SOURCES_DIR/include" "$MINIX_USR_MOUNT_DIR/include"
+
+  echo "Successfully pushed source files"
+  trap - ERR
+  minix_umount_img
+}
+
+prog_pull_sources() {
+  set -e
+  echo "Pulling source files from minix image"
+  minix_mount_img "$MINIX_WORK_IMAGE_PATH"
+  trap 'trap - ERR; minix_umount_img; echo_err "Failed to pull source files";' ERR
+
+  toolbox_copy_source_dirs_from_mounted_image
+
+  echo "Successfully pulled source files"
+  trap - ERR
+  minix_umount_img
+}
+
+# CLI utilities
+
+validate_no_options_or_exit() {
+  # $1 - command name
+  local command=$1
+  shift
+  if [ $# -gt 0 ]; then
+    echo_err "Unknown args '$*' for command '$command'"
+    exit 1
+  fi
+}
+
+# CLI commands
+
+cli_build() {
+  validate_no_options_or_exit 'build' "$@"
+  prog_build
+}
+
+cli_run() {
+  local filepath="$1"
+  shift
+  validate_no_options_or_exit 'run' "$@"
+  prog_run "$filepath"
+}
+
+cli_setup() {
+  validate_no_options_or_exit 'setup' "$@"
+  prog_img_setup
+}
+
+cli_push() {
+  validate_no_options_or_exit 'push' "$@"
+  prog_push_sources
+}
+
+cli_pull() {
+  validate_no_options_or_exit 'pull' "$@"
+  prog_pull_sources
+}
+
+# help messages printing
+
+print_usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME <command> [command options]
+
+Commands:
+  build         Sync source files and run minix compilation (make hdboot) on the current image.
+
+  run FILEPATH  Run a C/shell script on minix. If it is a C script it will be compiled before execution.
+                Script is treated as C script only if it has a '.c' extension, otherwise it is treated as shell script.
+
+  setup         Download the image from URL (defined in config) and prepare it to be used with build automation.
+                This command recompiles the downloaded image with RS232 serial port support enabled.
+                The minix sources are copied to workdir.
+
+  push          Copy changed source files form the workspace to minix image.
+
+  pull          Copy original source files form minix image to the workspace.
+
+EOF
+}
+
+# entrypoint
+
+if [ $# -lt 1 ]; then
+  print_usage
+  exit 0
+fi
+
+SUBCOMMAND="$1"
+shift
+
+case "$SUBCOMMAND" in
+build)
+  cli_build "$@"
+  ;;
+run)
+  cli_run "$@"
+  ;;
+setup)
+  cli_setup "$@"
+  ;;
+push)
+  cli_push "$@"
+  ;;
+pull)
+  cli_pull "$@"
+  ;;
+# TEMPORARY:
+mount)
+  minix_mount_img "$MINIX_BASE_IMAGE_PATH"
+  ;;
+umount)
+  minix_umount_img
+  ;;
+help | --help | -h)
+  print_usage
+  exit 0
+  ;;
+*)
+  echo_err "Invalid command '$SUBCOMMAND'."
+  print_usage >&2
+  exit 1
+  ;;
+esac
