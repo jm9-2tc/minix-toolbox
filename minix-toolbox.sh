@@ -272,8 +272,8 @@ toolbox_copy_source_dirs_from_mounted_image() {
   rm -rf "$MINIX_SOURCES_DIR"
   mkdir "$MINIX_SOURCES_DIR"
 
-  cp -r "$MINIX_USR_MOUNT_DIR/src" "$MINIX_SOURCES_DIR/src"
-  cp -r "$MINIX_USR_MOUNT_DIR/include" "$MINIX_SOURCES_DIR/include"
+  cp -rf "$MINIX_USR_MOUNT_DIR/src/." "$MINIX_SOURCES_DIR/src"
+  cp -rf "$MINIX_USR_MOUNT_DIR/include/." "$MINIX_SOURCES_DIR/include"
 }
 
 toolbox_workspace_check() {
@@ -467,8 +467,8 @@ prog_push_sources() {
   minix_mount_img "$MINIX_WORK_IMAGE_PATH"
   trap 'minix_umount_img; echo_err "Failed to push source files";' ERR
 
-  cp -r "$MINIX_SOURCES_DIR/src" "$MINIX_USR_MOUNT_DIR/src"
-  cp -r "$MINIX_SOURCES_DIR/include" "$MINIX_USR_MOUNT_DIR/include"
+  cp -rf "$MINIX_SOURCES_DIR/src/." "$MINIX_USR_MOUNT_DIR/src"
+  cp -rf "$MINIX_SOURCES_DIR/include/." "$MINIX_USR_MOUNT_DIR/include"
 
   chown -R 0:0 "$MINIX_USR_MOUNT_DIR/src"
   chown -R 0:0 "$MINIX_USR_MOUNT_DIR/include"
