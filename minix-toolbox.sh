@@ -24,7 +24,7 @@ MINIX_TTY01_PORT=4003
 
 # common utilities
 
-SCRIPT_VERSION="0.1.2"
+SCRIPT_VERSION="0.1.3"
 SCRIPT_NAME=$(basename "$0")
 
 echo_err() {
@@ -287,10 +287,15 @@ toolbox_workspace_check() {
 # subprograms
 
 prog_img_setup() {
+  # $1 - only rebuild image
   trap "$(set +o | grep errexit); trap - ERR" RETURN && set -e  # exit on err
-  echo "Setting up workdir for minix..."
 
-  toolbox_init_dirs
+  if [ "$1" == 0 ]; then
+    echo "Setting up workdir for minix..."
+    toolbox_init_dirs
+  else
+    echo "Rebuilding base image..."
+  fi
   minix_download_base_image
 
   minix_mount_img "$MINIX_BASE_IMAGE_PATH"
@@ -376,8 +381,10 @@ EOF
   sed -i 's/^tty00.*$/tty00\t\tvt100\t\t"\/bin\/sh"/' "${MINIX_ROOT_MOUNT_DIR}/etc/ttytab"
 
   # copy minix source files
-  echo "Copying source files from minix image"
-  toolbox_copy_source_dirs_from_mounted_image
+  if [ "$1" == 0 ]; then
+    echo "Copying source files from minix image"
+    toolbox_copy_source_dirs_from_mounted_image
+  fi
 
   trap - ERR
   minix_umount_img
@@ -385,7 +392,7 @@ EOF
   # copy base image as work image
   cp "$MINIX_BASE_IMAGE_PATH" "$MINIX_WORK_IMAGE_PATH"
 
-  echo "Workspace setup completed successfully"
+  echo "Setup completed successfully"
 }
 
 prog_build() {
@@ -506,6 +513,18 @@ validate_no_options_or_exit() {
 
 # CLI commands
 
+
+cli_setup() {
+  local rebuild=0
+  if [ "$1" == "--rebuild" ]; then
+    rebuild=1
+    shift
+  fi
+  validate_no_options_or_exit 'setup' "$@"
+  prog_img_setup "$rebuild"
+}
+
+
 cli_build() {
   validate_no_options_or_exit 'build' "$@"
   prog_build
@@ -516,11 +535,6 @@ cli_run() {
   shift
   validate_no_options_or_exit 'run' "$@"
   prog_run "$filepath"
-}
-
-cli_setup() {
-  validate_no_options_or_exit 'setup' "$@"
-  prog_img_setup
 }
 
 cli_push() {
@@ -540,20 +554,21 @@ print_usage() {
 Usage: $SCRIPT_NAME <command> [command options]
 
 Commands:
-  setup         Download the image from URL (defined in config) and prepare it to be used with this toolbox automation.
-                This command recompiles the downloaded image with RS232 serial port support enabled.
-                The minix sources are copied to the workdir.
-                If the workdir currently contains '.minix-toolkit' subdirectory after previous 'setup' call,
-                it will be deleted.
+  setup [--rebuild]           Download the image from URL (defined in config) and prepare it to be used with this toolbox automation.
+                              This command recompiles the downloaded image with RS232 serial port support enabled.
+                              A workdir will be initialized by creating toolkit subfolders and copying minix source code from
+                              the built image to the 'minix_source' subdirectory.
+                              If the current path already contains these subdirs, they will be deleted.
+                              Use the optional '--rebuild' flag to only rebuild the minix base image and skip workdir initialization.
 
-  build         Execute push and run minix compilation (make hdboot) on the current image.
+  build                       Execute push and run minix compilation (make hdboot) on the current image.
 
-  run FILEPATH  Run a C/shell script on minix. If it is a C script it will be compiled before execution.
-                Script is treated as C script only if it has a '.c' extension, otherwise it is treated as shell script.
+  run FILEPATH                Run a C/shell script on minix. If it is a C script it will be compiled before execution.
+                              Script is treated as C script only if it has a '.c' extension, otherwise it is treated as shell script.
 
-  push          Copy changed source files form the workspace to minix image.
+  push                        Copy changed source files form the workspace to minix image.
 
-  pull          Copy original source files form minix image to the workspace.
+  pull                        Copy original source files form minix image to the workspace.
 
 EOF
 }
@@ -586,7 +601,7 @@ pull)
   ;;
 # TEMPORARY:
 mount)
-  minix_mount_img "$MINIX_BASE_IMAGE_PATH"
+  minix_mount_img "$MINIX_WORK_IMAGE_PATH"
   ;;
 umount)
   minix_umount_img
