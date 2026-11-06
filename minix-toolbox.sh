@@ -173,11 +173,11 @@ minix_exec_and_stream() {
 # minix images mounting
 
 minix_read_image_subpartitions_info() {
-  set -e
+  trap "$(set +o | grep errexit); trap - ERR" RETURN && set -e  # exit on err
   local img_path=$1
   local -n root_offs=$2 root_siz=$3 usr_offs=$4 usr_siz=$5
 
-  trap 'trap - ERR; echo_err "Failed to read minix subpartitions from the image file"; return 1;' ERR
+  trap 'echo_err "Failed to read minix subpartitions from the image file"; return 1;' ERR
 
   if ! [ -f "$img_path" ]; then
     echo_err "minix image was not found at $img_path"
@@ -206,13 +206,12 @@ minix_read_image_subpartitions_info() {
   usr_offs=$(($usr_sector * 512))
   usr_siz=$(($usr_size_sec * 512))
 
-  trap - ERR
   return 0
 }
 
 minix_mount_img() {
   # $1 - image path
-  set -e
+  trap "$(set +o | grep errexit); trap - ERR" RETURN && set -e  # exit on err
   local mounts_failed=0
   local root_offset root_size usr_offset usr_size
 
@@ -230,7 +229,6 @@ Mounted minix image partitions:
 /usr     offset: $usr_offset, size: $usr_size, mounted at: "$MINIX_USR_MOUNT_DIR"
 EOF
 
-  trap - ERR
   return 0
 }
 
@@ -267,8 +265,8 @@ toolbox_init_dirs() {
 
 toolbox_copy_source_dirs_from_mounted_image() {
   # $1 image path
-  set -e
-  trap 'trap - ERR; return 1;' ERR
+  trap "$(set +o | grep errexit); trap - ERR" RETURN && set -e  # exit on err
+  trap 'return 1;' ERR
 
   rm -rf "$MINIX_SOURCES_DIR"
   mkdir "$MINIX_SOURCES_DIR"
@@ -288,14 +286,14 @@ toolbox_workspace_check() {
 # subprograms
 
 prog_img_setup() {
-  set -e
+  trap "$(set +o | grep errexit); trap - ERR" RETURN && set -e  # exit on err
   echo "Setting up workdir for minix..."
 
   toolbox_init_dirs
   minix_download_base_image
 
   minix_mount_img "$MINIX_BASE_IMAGE_PATH"
-  trap 'trap - ERR; minix_umount_img;' ERR
+  trap 'minix_umount_img; return 1;' ERR
 
   # enable 2 rs232 serial ports in config.h
   sed -i 's/^#define[ \t]\+NR_RS_LINES[ \t]\+[0-9]\+/#define	NR_RS_LINES        2/' "${MINIX_USR_MOUNT_DIR}/include/minix/config.h"
@@ -337,7 +335,7 @@ EOF
 
   local emul_pid
   minix_start_emulation "$MINIX_BASE_IMAGE_PATH" emul_pid
-  trap 'trap - ERR; minix_finish_emulation "$emul_pid";' ERR
+  trap 'minix_finish_emulation "$emul_pid"; return 1;' ERR
 
   local timeout=100
 
@@ -349,7 +347,7 @@ EOF
   minix_finish_emulation "$emul_pid"
 
   minix_mount_img "$MINIX_BASE_IMAGE_PATH"
-  trap 'trap - ERR; minix_umount_img;' ERR
+  trap 'minix_umount_img; return 1;' ERR
 
   # read recompilation status from logs
   local build_status=2 # 0 - success, 1 - error, 2 - unfinished
@@ -398,7 +396,10 @@ prog_build() {
   minix_start_emulation "$MINIX_WORK_IMAGE_PATH" emul_pid
 
   if minix_wait_for_terminal; then
-    minix_exec_and_stream "cd /usr/src/tools && make clean && make hdboot"
+    set +o | grep errexit
+    echo "Executing build command."
+    trap 'trap - ERR; echo "It finished!"' ERR
+    minix_exec_and_stream "cd /usr/src/tools && make clean && make hdboot; sleep 10"
   fi
 
   minix_finish_emulation "$emul_pid"
@@ -406,7 +407,7 @@ prog_build() {
 
 prog_run() {
   # $1 - c/sh script path
-  set -e
+  trap "$(set +o | grep errexit); trap - ERR" RETURN && set -e  # exit on err
 
   if ! [ -f "$1" ]; then
     echo_err "'$1' does not exist or is not a file."
@@ -423,7 +424,7 @@ prog_run() {
 
   # copy script to minix image
   minix_mount_img "$MINIX_WORK_IMAGE_PATH"
-  trap 'trap - ERR; minix_umount_img; return 1;' ERR
+  trap 'minix_umount_img; return 1;' ERR
 
   echo "Sending script to minix"
   local dir_path="$MINIX_USR_MOUNT_DIR/run_script"
@@ -436,7 +437,7 @@ prog_run() {
 
   local emul_pid
   minix_start_emulation "$MINIX_WORK_IMAGE_PATH" emul_pid
-  trap 'trap - ERR; minix_finish_emulation; return 1;' ERR
+  trap 'minix_finish_emulation; return 1;' ERR
 
   # run script (after compilation if it is a C file)
   if minix_wait_for_terminal; then
@@ -444,12 +445,12 @@ prog_run() {
     if [ $is_c_script == 1 ]; then
       local out_prog_name="${filename%.*}"
       echo "Compiling C script..."
-      minix_exec_and_stream "cd /usr/run_script/ && cc -o '$out_prog_name' '$filename'" && true
+      minix_exec_and_stream "cd /usr/run_script/ && cc -o '$out_prog_name' '$filename'"
       filename="$out_prog_name"
     fi
 
     echo "Running script..."
-    minix_exec_and_stream "cd /usr/run_script/ && chmod +x '$filename' && './$filename'" && true
+    minix_exec_and_stream "cd /usr/run_script/ && chmod +x '$filename' && './$filename'"
 
     echo "Script execution finished."
   fi
@@ -459,29 +460,27 @@ prog_run() {
 }
 
 prog_push_sources() {
-  set -e
+  trap "$(set +o | grep errexit); trap - ERR" RETURN && set -e  # exit on err
   echo "Pushing source files to minix image"
   minix_mount_img "$MINIX_WORK_IMAGE_PATH"
-  trap 'trap - ERR; minix_umount_img; echo_err "Failed to push source files";' ERR
+  trap 'minix_umount_img; echo_err "Failed to push source files";' ERR
 
   cp -r "$MINIX_MINIX_SOURCES_DIR/src" "$MINIX_USR_MOUNT_DIR/src"
   cp -r "$MINIX_MINIX_SOURCES_DIR/include" "$MINIX_USR_MOUNT_DIR/include"
 
   echo "Successfully pushed source files"
-  trap - ERR
   minix_umount_img
 }
 
 prog_pull_sources() {
-  set -e
+  trap "$(set +o | grep errexit); trap - ERR" RETURN && set -e  # exit on err
   echo "Pulling source files from minix image"
   minix_mount_img "$MINIX_WORK_IMAGE_PATH"
-  trap 'trap - ERR; minix_umount_img; echo_err "Failed to pull source files";' ERR
+  trap 'minix_umount_img; echo_err "Failed to pull source files";' ERR
 
   toolbox_copy_source_dirs_from_mounted_image
 
   echo "Successfully pulled source files"
-  trap - ERR
   minix_umount_img
 }
 
