@@ -24,7 +24,7 @@ MINIX_TTY01_PORT=4003
 
 # common utilities
 
-SCRIPT_VERSION="0.1.1"
+SCRIPT_VERSION="0.1.2"
 SCRIPT_NAME=$(basename "$0")
 
 echo_err() {
@@ -391,7 +391,7 @@ EOF
 prog_build() {
   echo "Starting minix recompilation..."
 
-  prog_pull_sources
+  prog_push_sources
 
   local emul_pid
   minix_start_emulation "$MINIX_WORK_IMAGE_PATH" emul_pid
