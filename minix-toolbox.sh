@@ -24,7 +24,7 @@ MINIX_TTY01_PORT=4003
 
 # common utilities
 
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.1.1"
 SCRIPT_NAME=$(basename "$0")
 
 echo_err() {
