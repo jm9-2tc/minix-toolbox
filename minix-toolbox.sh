@@ -138,10 +138,18 @@ minix_finish_emulation() {
 
 minix_exec_and_stream() {
   # $1 - command to exec
+  trap "$(set +o | grep errexit)" RETURN && set +e  # disable exit on err
   local marker="__DONE_MARKER__"
+  local timeout=300
 
-  echo "( $1 ) 2>/dev/tty01 >/dev/tty01; printf '\n$marker\n'" >&4
-  ( grep -q "$marker" <&4; ) &
+  echo "( $1 ) 2>/dev/tty01 >/dev/tty01; echo '$marker'" >&4
+  (
+    while read -r -t "$timeout" line <&4; do
+      if [ "${line%$'\r'}" == "$marker" ]; then
+        break;
+      fi
+    done
+  ) &
   local term_scanner_pid=$!
   local running=1
 
@@ -149,11 +157,11 @@ minix_exec_and_stream() {
     read -r -t 1 line <&5 2>/dev/null
     ! [ -z "$line" ] && echo "$line"
 
-    if ! kill -1 "$term_scanner_pid" 2>/dev/null; then
+    if ! kill -0 "$term_scanner_pid" 2>/dev/null; then
       wait "$term_scanner_pid"
       local status=$?
       if [ $status != 0 ]; then
-        echo_err "an error was encountered while executing the command"
+        echo_err "an error was encountered while streaming command output from minix"
       fi
       running=0
     fi
