@@ -24,7 +24,7 @@ MINIX_TTY01_PORT=4003
 
 # common utilities
 
-SCRIPT_VERSION="0.1.3"
+SCRIPT_VERSION="v0.1.3"
 SCRIPT_NAME=$(basename "$0")
 
 echo_err() {
@@ -86,10 +86,12 @@ minix_wait_for_terminal() {
 minix_start_emulation() {
   # $1 - minix image path
   # $2 - minix emul pid ref
+  # $3 - should use display? (0/1)
   local -n pid=$2
+  local display_mode=$( ([ "$3" == 1 ] && echo 'gtk') || echo 'none' )
 
   qemu-system-i386 \
-    -display none \
+    -display "$display_mode" \
     -drive format=raw,file="$1" \
     -serial tcp:"$HOST":"$MINIX_TTY00_PORT",server,nowait \
     -serial tcp:"$HOST":"$MINIX_TTY01_PORT",server,nowait \
@@ -140,6 +142,7 @@ minix_exec_and_stream() {
   # $1 - command to exec
   trap "$(set +o | grep errexit)" RETURN && set +e  # disable exit on err
   local marker="__DONE_MARKER__"
+  local separator="--------------------------------"
   local timeout=300
 
   echo "( $1 ) 2>/dev/tty01 >/dev/tty01; echo '$marker'" >&4
@@ -152,10 +155,15 @@ minix_exec_and_stream() {
   ) &
   local term_scanner_pid=$!
   local running=1
+  local write_seps=0
 
   while [ $running == 1 ]; do
     read -r -t 1 line <&5 2>/dev/null
-    ! [ -z "$line" ] && echo "$line"
+    if ! [ -z "$line" ]; then
+      # write separator if it was first line streamed from the command
+      [ "$write_seps" == 0 ] && write_seps=1 && echo "$separator"
+      echo "$line"
+    fi
 
     if ! kill -0 "$term_scanner_pid" 2>/dev/null; then
       wait "$term_scanner_pid"
@@ -166,6 +174,7 @@ minix_exec_and_stream() {
       running=0
     fi
   done
+  [ "$write_seps" != 0 ] && echo "$separator"
 
   return 0
 }
@@ -415,6 +424,7 @@ prog_build() {
 
 prog_run() {
   # $1 - c/sh script path
+  # $2 - 0/1 flag if emulation should use display
   trap "$(set +o | grep errexit); trap - ERR" RETURN && set -e  # exit on err
 
   if ! [ -f "$1" ]; then
@@ -445,7 +455,7 @@ prog_run() {
   trap - ERR
 
   local emul_pid
-  minix_start_emulation "$MINIX_WORK_IMAGE_PATH" emul_pid
+  minix_start_emulation "$MINIX_WORK_IMAGE_PATH" emul_pid "$2"
   trap 'minix_finish_emulation; return 1;' ERR
 
   # run script (after compilation if it is a C file)
@@ -531,10 +541,15 @@ cli_build() {
 }
 
 cli_run() {
+  local display=0
+  if [ "$1" == "--display" ]; then
+    display=1
+    shift
+  fi
   local filepath="$1"
   shift
   validate_no_options_or_exit 'run' "$@"
-  prog_run "$filepath"
+  prog_run "$filepath" "$display"
 }
 
 cli_push() {
@@ -551,6 +566,7 @@ cli_pull() {
 
 print_usage() {
   cat <<EOF
+Minix Toolbox $SCRIPT_VERSION
 Usage: $SCRIPT_NAME <command> [command options]
 
 Commands:
@@ -563,8 +579,10 @@ Commands:
 
   build                       Execute push and run minix compilation (make hdboot) on the current image.
 
-  run FILEPATH                Run a C/shell script on minix. If it is a C script it will be compiled before execution.
+  run [--display] FILEPATH    Run a C/shell script on minix. If it is a C script it will be compiled before execution.
                               Script is treated as C script only if it has a '.c' extension, otherwise it is treated as shell script.
+                              Use optional '--display' flag to show text display for minix emulation, this can be useful for displaying
+                              printf messages from the kernel.
 
   push                        Copy changed source files form the workspace to minix image.
 
